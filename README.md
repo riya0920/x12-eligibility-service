@@ -14,9 +14,10 @@ Offline, under a second, standard library only.
 ## Scope boundary, stated first
 
 This is **structurally honest, not certification-complete**. Real envelopes,
-real loops, real code values — and *not* a HIPAA-compliant transaction
-implementation. Missing: the X12N implementation guide's situational rules, full
-999/TA1 acknowledgement, and any certification testing.
+real loops, real code values, and a 999 that reports genuine syntax errors with
+positions — and *not* a HIPAA-compliant transaction implementation. Missing: the
+X12N implementation guide's situational rules, TA1 interchange acknowledgement,
+CTX context segments, and any certification testing.
 
 Saying so is the mature move. Claiming transaction fidelity that has not been
 tested against a certification suite is the overclaim that ends a screen,
