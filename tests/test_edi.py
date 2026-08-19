@@ -262,3 +262,96 @@ def test_276_round_trips(control):
     assert x12.check_envelope(ix) == []
     refs = [s for s in ix.find("REF") if s.get(1) == "1K"]
     assert refs[0].get(2) == "CLM1"
+
+
+# ---------------------------------------------------------------------------
+# 999 implementation acknowledgement
+# ---------------------------------------------------------------------------
+import ack999 as A
+
+
+def test_well_formed_transaction_is_accepted(control):
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    _out, s = A.build_999(ix, control)
+    assert s["ack"] == "A" and s["n_errors"] == 0
+
+
+def test_invalid_code_value_is_accepted_with_errors_not_rejected(control):
+    """An unrecognised service-type code is a data error in one element, not a
+    reason to discard a readable transaction."""
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    bad = x12.parse(ix.render().replace("EQ*30", "EQ*ZZ"))
+    _out, s = A.build_999(bad, control)
+    assert s["ack"] == "E"
+    assert any("Invalid code value" in e for e in s["errors"])
+
+
+def test_envelope_failure_rejects_the_whole_interchange(control):
+    """A control-number mismatch means the interchange cannot be trusted.
+    Accepting the transactions inside a broken envelope is how a partial file
+    gets processed as though it were whole."""
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    tampered = x12.parse(ix.render().replace("~IEA*1*", "~IEA*1*9"))
+    _out, s = A.build_999(tampered, control)
+    assert s["ack"] == "R"
+    assert "envelope" in s["note"]
+
+
+def test_missing_required_segment_is_rejected(control):
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    stripped = x12.parse(ix.render().replace("EQ*30~", ""))
+    _out, s = A.build_999(stripped, control)
+    assert s["ack"] == "R"
+
+
+def test_error_reports_carry_a_position_so_they_are_actionable(control):
+    """'Your file was rejected' is useless to whoever has to fix it."""
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    bad = x12.parse(ix.render().replace("EQ*30", "EQ*ZZ"))
+    errors, _ts = A.validate(bad)
+    assert errors
+    e = errors[0]
+    assert e.position > 0
+    assert e.element is not None
+    assert "segment" in e.describe() and "element" in e.describe()
+
+
+def test_999_is_a_valid_interchange_itself(control):
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    out, _s = A.build_999(ix, control)
+    assert x12.check_envelope(out) == []
+    assert out.first("ST").get(1) == "999"
+    assert out.first("GS").get(1) == "FA"      # functional acknowledgement
+
+
+def test_999_round_trips(control):
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    bad = x12.parse(ix.render().replace("EQ*30", "EQ*ZZ"))
+    out, s = A.build_999(bad, control)
+    parsed = A.parse_999(x12.parse(out.render()))
+    assert parsed["ack"] == s["ack"]
+    assert parsed["errors"]
+
+
+def test_ak9_reports_counts(control):
+    ix = T.build_270(control, "W1", "A", "B", "1980-01-01", "30", "2024-06-12")
+    out, _s = A.build_999(ix, control)
+    ak9 = out.first("AK9")
+    assert ak9.get(1) == "A"
+    assert ak9.get(2) == "1"          # transaction sets included
+
+
+def test_syntax_and_business_failures_are_different_channels(core, control):
+    """The distinction the onboarding doc leads with: a member who does not
+    exist is a BUSINESS outcome (271 + AAA); a malformed transaction is a
+    SYNTAX outcome (999) with no 271 at all."""
+    ix = T.build_270(control, "W999999999", "NOBODY", "", "1970-01-01",
+                     "98", "2024-06-12")
+    _out, ack = A.build_999(ix, control)
+    assert ack["ack"] == "A", "a well-formed inquiry is syntactically fine"
+
+    parsed = T.parse_270(ix)
+    resp, meta = T.build_271(control, parsed, core)
+    js = T.to_json(T.parse_271(resp), meta)
+    assert js["benefit_determination"] == "inquiry_rejected"
+    assert js["rejection"]["code"] == "75"

@@ -13,6 +13,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
+import ack999 as A
 import transactions as T
 import x12
 from payer import PayerCore
@@ -173,6 +174,48 @@ def main():
     print("  the whole interchange, not just the offending transaction, which")
     print("  is why it is checked before any business logic runs.")
 
+    # ---- 999 acknowledgement ---------------------------------------------
+    print()
+    print("=" * 78)
+    print("999 IMPLEMENTATION ACKNOWLEDGEMENT -- syntax, not business")
+    print("=" * 78)
+    print("  A 271 answers 'is this member covered'. A 999 answers 'was your")
+    print("  transaction syntactically usable'. They are separate because the")
+    print("  failures are separate, and a partner that only implements the 271")
+    print("  path cannot tell 'the answer is no' from 'we could not read your")
+    print("  file' -- which need different responses from different teams.")
+    print()
+    well_formed = T.build_270(control, "W123456789", "SMITH", "JANE",
+                              "1956-03-12", "98", "2024-06-12")
+    scenarios = [
+        ("well-formed 270", well_formed),
+        ("invalid service-type code",
+         x12.parse(well_formed.render().replace("EQ*98", "EQ*ZZ"))),
+        ("required EQ segment missing",
+         x12.parse(well_formed.render().replace("EQ*98~", ""))),
+        ("tampered interchange control number",
+         x12.parse(well_formed.render().replace("~IEA*1*", "~IEA*1*9"))),
+    ]
+    print(f"  {'scenario':<40}{'IK5':>5}  meaning")
+    ack_results = {}
+    for label, ix in scenarios:
+        _out, s999 = A.build_999(ix, control)
+        ack_results[label] = s999
+        print(f"  {label:<40}{s999['ack']:>5}  {s999['note']}")
+        for e in s999["errors"][:2]:
+            print(f"        {e}")
+
+    print()
+    print("  IK3 and IK4 carry the SEGMENT POSITION and ELEMENT NUMBER, which")
+    print("  is the whole point: 'your file was rejected' is useless to the")
+    print("  person who has to fix it, and 'segment 14, element 1, invalid")
+    print("  code value' is a ticket they can close.")
+    print()
+    print("  An envelope failure rejects the WHOLE interchange rather than one")
+    print("  transaction, because accepting the transactions inside a broken")
+    print("  envelope is how a partial file gets processed as though it were")
+    print("  whole.")
+
     # ---- batch mode -------------------------------------------------------
     print("\n" + "=" * 78)
     print("BATCH MODE -- because payers still run batch eligibility in 2026")
@@ -231,7 +274,8 @@ def main():
                "batch": {"in": len(batch), "out": len(responses),
                          "rejects": rejects,
                          "tps": len(responses) / dt},
-               "aaa_codes_implemented": len(AAA_REJECT)}
+               "aaa_codes_implemented": len(AAA_REJECT),
+               "ack999": {k: v["ack"] for k, v in ack_results.items()}}
     with open(f"{OUT}/results.json", "w") as fh:
         json.dump(payload, fh, indent=2, default=str)
     print(f"\nwrote {OUT}/results.json")
