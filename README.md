@@ -187,7 +187,7 @@ problem.
 
 ---
 
-## What is missing (the other 80%)
+## What is still missing
 
 - **No certification.** The 999 checks envelope integrity, required segments,
   required elements and code values — not implementation-guide situational
