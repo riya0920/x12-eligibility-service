@@ -1,4 +1,4 @@
-# SE-2 — Eligibility & claim status (X12 EDI facade) (~50% build)
+# SE-2 — Eligibility & claim status (X12 EDI facade) (~80% build)
 
 270/271 and 276/277 with real envelopes, real control numbers, and real AAA
 rejection semantics — behind a JSON facade that **refuses to flatten an
@@ -6,7 +6,9 @@ ambiguous answer into a boolean**.
 
 ```bash
 python run_demo.py         # real-time + batch, accumulators, 999, round-trip
-python -m pytest tests -q  # 36 tests
+python serve.py --demo     # the HTTP facade, both languages, the throttle
+python serve.py            # serve on :8088; /dashboard.html
+python -m pytest tests -q  # 59 tests
 ```
 
 Offline, under a second, standard library only.
@@ -187,24 +189,122 @@ problem.
 
 ---
 
+## Throttling that speaks X12, an HTTP facade, and a dashboard
+
+Closes three named gaps: no HTTP layer, no throttling enforcement, no
+transaction dashboard.
+
+### The rate limiter is thirty lines. The refusal is the hard part.
+
+A trading partner submitting a 270 has a system that parses 271s. It may parse
+nothing else. **Returning HTTP 429 with a JSON body to that system is returning
+nothing**: the response is not a 271, so their parser errors or drops it, and
+the inquiry looks to their operations team like a *timeout*. They will retry,
+because timeouts are retryable — which is precisely the behaviour a rate
+limiter exists to prevent.
+
+X12 already has the vocabulary:
+
+```
+AAA03 = 42   Unable to respond at current time
+AAA04 = R    Resubmission allowed
+```
+
+So the refusal goes back **both ways** — HTTP 429 with `Retry-After` for
+anything speaking HTTP, and a well-formed 271 carrying `AAA*Y**42*R` for
+anything speaking X12. Neither alone is sufficient:
+
+```
+request 4: 429  Retry-After 60s  AAA 42 'Unable to respond at current time' / Resubmission allowed
+
+the same refusal to an X12 client -> 429 application/edi-x12
+  X-AAA-Code: 42   Retry-After: 60
+  and in the body: AAA*Y**42*R
+```
+
+A throttled 271 carries **no EB segments at all** — a throttled inquiry has no
+benefit answer, and returning EB with unknown values would be worse than
+refusing.
+
+### The limits are contract terms, not engineering constants
+
+`TRADING_PARTNER_AGREEMENTS` makes the onboarding document's numbers
+executable, so the two cannot drift. That framing settles the spec's question —
+what happens when a partner sends 10,000 inquiries an hour against an agreement
+for 1,000:
+
+> Serve the agreed rate, refuse the excess in a form their system understands,
+> and escalate commercially. **Absorbing it silently sets a de-facto limit
+> nobody agreed to**, and the next partner discovers it too.
+
+Refill is **continuous**, not a fixed window. A fixed hourly window lets a
+partner send their whole allowance in the last second of one hour and again in
+the first second of the next — twice the agreed rate across two seconds,
+entirely within policy as written.
+
+An unknown submitter gets a **default agreement** rather than being blocked
+outright or served without limit. Both of those have been somebody's outage.
+
+### The dashboard reports rejections by AAA code, not as one rate
+
+| AAA03 | reason | n | share |
+|---|---|---|---|
+| `42` | Unable to respond at current time | 4 | 36.4% |
+| `75` | Subscriber/insured not found | 1 | 9.1% |
+
+`75` is the submitter sending bad member IDs. `42` is **us** throttling them.
+`57` would be their date formatting. Three different phone calls — and a single
+rejection-rate figure conflates all of them and tells an operations team
+nothing about who to ring.
+
+### Two facades, and the source document travels with the translation
+
+`POST /x12/270` speaks raw X12. `POST /eligibility` speaks JSON, for a front
+end that should never have to know what an EB01 code is — but it returns the
+**271 alongside**, because a facade that discards the source document makes
+every disagreement between two systems unresolvable. When a provider says *"your
+system told us the patient was covered"*, the answer has to be the 271 that was
+actually sent.
+
+An unknown member is **HTTP 200 with `answered: false`** and AAA 75, not a 404.
+The transaction succeeded; the *answer* is a rejection. A 404 conflates "we
+could not process your inquiry" with "this member does not exist", and the front
+desk needs the second one to know to correct the ID and resubmit.
+
+### A bug the tests found
+
+`x12.parse` is tolerant by design and returns an `Interchange` for anything. A
+payload of `"this is not X12"` therefore parsed to an empty inquiry, reached
+`build_271`, and came back **200 with AAA 75 "subscriber not found"** — an
+answer about a member, to something that was never a transaction. The facade now
+validates the envelope first. In X12 terms a malformed interchange deserves a
+**TA1** interchange acknowledgement rather than any 271; TA1 is not implemented
+(it is on the gap list), so this returns 400 and says so rather than pretending
+the envelope was fine.
+
 ## What is still missing
 
 - **No certification.** The 999 checks envelope integrity, required segments,
   required elements and code values — not implementation-guide situational
   rules, loop repetition limits, or CTX context segments, and it is not tested
   against a certification suite. **No TA1** (interchange acknowledgement) at all.
-- **No throttling enforcement.** The volume policy is written down in the
-  onboarding doc; there is no rate limiter, no quota tracking, and no
-  per-partner throttle behind it.
-- **No transaction dashboard.** Volume, rejection rate by AAA code, and response
-  times are computed but only printed; there is no UI and no time series.
-- **No throttling or trading-partner agreement enforcement.** The spec's
-  10K-inquiries-per-hour question is unaddressed in code. The answer is that a
-  TPA governs volume, and the response is to serve within the agreed rate and
-  escalate commercially rather than silently degrade — but none of that is
-  implemented.
-- **No HTTP layer.** The "REST facade" is a Python function returning a dict.
-  No auth, no rate limiting, no HTTP semantics.
+- **The throttle is in-process and single-node.** The buckets are a dict, so
+  a second instance doubles every limit. Real deployment needs shared state
+  (Redis, or a gateway that owns the counter). No burst borrowing across
+  windows, no per-endpoint limits, and — a real gap — **no priority lanes**: an
+  eligibility check at a bedside is not the same request as a batch
+  reconciliation, and this throttles them identically.
+- **The dashboard has no time series and no persistence.** Counters are
+  in-memory and reset with the process, so there is no trend, no alerting, and
+  no way to answer "when did partner B's rejection rate change".
+- **Agreement enforcement covers volume only.** A real TPA also governs
+  transaction types, hours of operation, test-versus-production separation,
+  connectivity method and certificate rotation. None of those is enforced.
+- **The HTTP layer has no authentication.** The trading partner is taken from
+  a header, which anyone can set — so the throttle is an honesty system, not a
+  control. Real EDI connectivity is mutually-authenticated (AS2 certificates,
+  SFTP keys, or mTLS), and identity has to come from the transport rather than
+  from a header.
 - **No 837 claim submission**, no 835 remittance, no 834 enrolment — so the
   claims store is populated by a direct `adjudicate()` call rather than by the
   transaction that would really create it.
@@ -222,4 +322,8 @@ problem.
 | `src/payer.py` | members, coverage spans, benefits, accumulators, adjudication |
 | `src/transactions.py` | 270/271, 276/277, and the ambiguity-preserving facade |
 | `run_demo.py` | five answer states, accumulator linkage, round-trip, batch |
+| `src/throttle.py` | TPA-driven token bucket; refusal expressed as AAA 42/R |
+| `serve.py` | HTTP facade (X12 and JSON), throttle, transaction dashboard |
+| `demo_http.py` | exercises both facades and the throttle in both |
+| `tests/test_http.py` | 23 tests: the bucket, the X12 refusal, the dashboard |
 | `tests/test_edi.py` | 36 tests |
