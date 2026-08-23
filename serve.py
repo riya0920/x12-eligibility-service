@@ -45,13 +45,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import ta1 as TA1
 import throttle as TH
 import transactions as TX
 import x12
 from payer import PayerCore
 from x12 import AAA_ACTION, AAA_REJECT, Segment
 
-_STATE = {"core": None, "throttle": None, "log": None, "control": None}
+_STATE = {"core": None, "throttle": None, "log": None,
+          "control": None, "seen_isa": {}, "lanes": {}}
 MAX_BYTES = 500_000
 
 
@@ -110,12 +112,36 @@ class TransactionLog:
         }
 
 
+def _lane_for(partner):
+    """Per-partner priority lanes, created on first use."""
+    if partner not in _STATE["lanes"]:
+        a = _STATE["throttle"].agreement(partner)
+        _STATE["lanes"][partner] = TA1.Lane(a["per_hour"], a["burst"])
+    return _STATE["lanes"][partner]
+
+
 def _next_control():
     return _STATE["control"]
 
 
 def throttled_271(inquiry, detail):
-    """A well-formed 271 that says 'not now', in the partner's own language."""
+    """A well-formed 271 that says 'not now', in the partner's own language.
+
+    The AAA fields are defaulted HERE rather than assumed, because a refusal
+    can now come from two places -- the partner-level bucket, which supplies
+    them, and the priority lane, which does not. A lane refusal reaching this
+    function without them raised a KeyError deep inside, and an unhandled
+    exception in a request handler drops the connection rather than answering,
+    so the client saw RemoteDisconnected: a network fault, indistinguishable
+    from a real one.
+    """
+    detail = dict(detail)
+    detail.setdefault("aaa_code", TH.THROTTLE_AAA_CODE)
+    detail.setdefault("aaa_action", TH.THROTTLE_AAA_ACTION)
+    detail.setdefault("retry_after_seconds", 60)
+    detail.setdefault("per_hour", 0)
+    detail.setdefault("burst", 0)
+    detail.setdefault("escalation", "lane allowance exhausted")
     control = _next_control()
     segs = [
         Segment("BHT", "0022", "11", inquiry.get("trace", "TRN1"),
@@ -198,10 +224,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(413, {"error": "payload too large"})
         raw = self.rfile.read(n)
 
-        if path == "/x12/270":
-            return self._x12(raw, t0)
-        if path == "/eligibility":
-            return self._json(raw, t0)
+        try:
+            if path == "/x12/270":
+                return self._x12(raw, t0)
+            if path == "/eligibility":
+                return self._json(raw, t0)
+        except Exception as exc:                       # noqa: BLE001
+            # ANSWER, DO NOT DROP THE SOCKET. An unhandled exception in a
+            # request handler closes the connection, and the client sees
+            # RemoteDisconnected -- indistinguishable from a network fault and
+            # invisible to any harness that only catches HTTPError.
+            return self._send(500, {"error": "internal error",
+                                    "type": type(exc).__name__})
         return self._send(404, {"error": f"no route {path}"})
 
     def _x12(self, raw, t0):
@@ -234,17 +268,48 @@ class Handler(BaseHTTPRequestHandler):
                                  transaction="270", outcome="unparseable",
                                  duration_ms=(time.perf_counter() - t0) * 1000,
                                  http_status=400)
-            return self._send(400, {
-                "error": "not a usable 270",
-                "detail": str(exc)[:200],
-                "note": ("a real implementation answers a malformed "
-                         "interchange with a TA1 interchange acknowledgement, "
-                         "not an HTTP status. TA1 is not implemented here."),
-            })
+            # A TA1, NOT AN HTTP STATUS. A malformed interchange is an
+            # INTERCHANGE-level problem, and a 999 cannot answer it: a 999 is
+            # itself wrapped in an envelope and references the GS control
+            # number of what it acknowledges, so when the ISA does not parse
+            # that reference is not constructible.
+            ack = TA1.build_ta1(raw, seen_control_numbers=_STATE["seen_isa"])
+            _STATE["log"].record(
+                partner=self._partner() or "UNKNOWN", transaction="TA1",
+                outcome="interchange-rejected",
+                duration_ms=(time.perf_counter() - t0) * 1000,
+                http_status=400)
+            return self._send(
+                400, ack["segment"].encode(),
+                [("X-TA1-Ack", ack["ack_code"]),
+                 ("X-TA1-Note", ack["note_code"])],
+                "application/edi-x12")
 
         partner = (self._partner() or interchange.sender_id
                    or "UNKNOWN")
+        # A duplicate interchange is a TA1 025, not a business rejection: the
+        # sender resent a transmission we already processed, and answering with
+        # a 271 would adjudicate the same inquiry twice.
+        # PER PARTNER, not global. ISA13 is unique within one sender's
+        # interchanges; two trading partners both numbering from 1 is normal
+        # and expected. A global set rejects partner B's first transmission as
+        # a duplicate of partner A's -- caught because the test suite runs
+        # several partners in one process and a test that passed alone failed
+        # in the suite.
+        seen = _STATE["seen_isa"].setdefault(partner, set())
+        dup = TA1.build_ta1(raw, seen_control_numbers=seen)
+        if dup["note_code"] == "025":
+            return self._send(400, dup["segment"].encode(),
+                              [("X-TA1-Ack", dup["ack_code"]),
+                               ("X-TA1-Note", "025")],
+                              "application/edi-x12")
+        seen.add(dup["interchange_control_number"])
+        lane = (self.headers.get("X-Priority-Lane") or TA1.INTERACTIVE).lower()
         ok, detail = _STATE["throttle"].check(partner)
+        if ok:
+            ok, lane_detail = _lane_for(partner).check(
+                lane if lane in (TA1.INTERACTIVE, TA1.BATCH) else TA1.INTERACTIVE)
+            detail = {**detail, **lane_detail}
         if not ok:
             out, meta = throttled_271(inquiry, detail)
             _STATE["log"].record(partner=partner, transaction="270",
@@ -397,6 +462,8 @@ def serve(port=8088, core=None, throttle=None):
     _STATE["core"] = core or PayerCore()
     _STATE["throttle"] = throttle or TH.Throttle()
     _STATE["control"] = x12.ControlNumbers()
+    _STATE["seen_isa"] = {}
+    _STATE["lanes"] = {}
     _STATE["log"] = TransactionLog()
     httpd = HTTPServer(("127.0.0.1", port), Handler)
     print(f"serving on http://127.0.0.1:{port}")

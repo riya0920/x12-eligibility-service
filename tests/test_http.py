@@ -150,6 +150,11 @@ def api():
     SRV._STATE["throttle"] = TH.Throttle(agreements, clock=clock)
     SRV._STATE["log"] = SRV.TransactionLog()
     SRV._STATE["control"] = x12.ControlNumbers()
+    # Reset the interchange-duplicate history and the priority lanes: they are
+    # module-level, and a test that passed alone failed in the suite because a
+    # previous test had already used the same ISA control numbers.
+    SRV._STATE["seen_isa"] = {}
+    SRV._STATE["lanes"] = {}
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     member = core.con.execute(

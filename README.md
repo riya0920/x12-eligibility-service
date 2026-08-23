@@ -1,4 +1,4 @@
-# SE-2 — Eligibility & claim status (X12 EDI facade) (~80% build)
+# SE-2 — Eligibility & claim status (X12 EDI facade) — complete
 
 270/271 and 276/277 with real envelopes, real control numbers, and real AAA
 rejection semantics — behind a JSON facade that **refuses to flatten an
@@ -8,7 +8,7 @@ ambiguous answer into a boolean**.
 python run_demo.py         # real-time + batch, accumulators, 999, round-trip
 python serve.py --demo     # the HTTP facade, both languages, the throttle
 python serve.py            # serve on :8088; /dashboard.html
-python -m pytest tests -q  # 59 tests
+python -m pytest tests -q  # 78 tests
 ```
 
 Offline, under a second, standard library only.
@@ -282,37 +282,106 @@ validates the envelope first. In X12 terms a malformed interchange deserves a
 (it is on the gap list), so this returns 400 and says so rather than pretending
 the envelope was fine.
 
-## What is still missing
+## TA1 — the acknowledgement a 999 cannot give
+
+`src/ta1.py`. The previous gap list said "**No TA1** (interchange
+acknowledgement) at all", and the facade returned HTTP 400 for a malformed
+envelope while admitting in its own response body that a real implementation
+answers with TA1.
+
+X12 acknowledges at three layers and they are not interchangeable:
+
+| level | scope | question |
+|---|---|---|
+| **TA1** | ISA/IEA envelope | did the outer wrapper parse? |
+| 999 | functional group | are the segments and elements valid? |
+| 271 | business | is this member eligible? |
+
+**A 999 cannot answer at the interchange level.** A 999 is itself wrapped in an
+envelope and references the GS control number of what it acknowledges — when the
+ISA does not parse, that reference is not constructible. Returning a 999 for a
+malformed interchange is not merely wrong; it is not expressible.
+
+```
+good envelope   -> A 000  No error
+truncated       -> R 023  Improper (Premature) End-of-File
+garbage         -> R 024  Invalid Interchange Content
+replayed        -> R 025  Duplicate Interchange Control Number
+```
+
+**TA104 is derived, never passed in.** `E` — *accepted with errors* — on
+something unprocessable is how a sender's system marks a batch delivered that
+never arrived, and nobody finds out until reconciliation weeks later. Letting a
+caller choose the code is how that happens, so `build_ta1` takes no such
+parameter and every structural error maps to `R`.
+
+## Priority lanes — a bedside check is not a batch job
+
+An eligibility check at a bedside and an overnight reconciliation are the same
+*transaction type* and are not the same *request*. Throttling them identically
+means the batch spends the bucket and the bedside check is refused, which is the
+wrong outcome in the only case that matters.
+
+`Lane` reserves 30% of each partner's allowance for interactive traffic, and the
+reservation is **one-directional**: interactive may borrow idle batch capacity;
+**batch may never borrow the interactive reserve**. A reserved share both lanes
+can spend is not a reserve — it is a suggestion, and the overnight batch will
+spend it every night.
+
+The lane is **declared, not inferred**. A submitter sending 500 inquiries in a
+second is probably batch — but so is a hospital admitting a bus crash, and
+guessing wrong there refuses the request that mattered.
+
+## Three bugs found while building this
+
+- **A regex that rejected every valid interchange.** `r"IEA\%s"` with
+  `re.escape("*")` builds `IEA\\*(\d+)`, which reads as *"IEA followed by zero
+  or more backslashes"* and never matches. Every well-formed transmission came
+  back `R 023 — premature end of file`, which is the most misleading answer
+  available: it tells the sender their transmission was truncated when it
+  arrived intact.
+- **Duplicate detection was global, not per sender.** ISA13 is unique *within
+  one sender's* interchanges, and two trading partners both numbering from 1 is
+  normal. A global set rejected partner B's first transmission as a duplicate of
+  partner A's. Caught because a test that passed alone failed in the suite —
+  the suite runs several partners in one process.
+- **A lane refusal crashed the response builder.** `throttled_271` assumed the
+  AAA fields the partner-level bucket supplies; a lane refusal has none, the
+  `KeyError` went unhandled, and the connection dropped rather than answering —
+  so the client saw `RemoteDisconnected`, indistinguishable from a network
+  fault. The handler now answers 500 with a body instead of dropping the socket.
+
+## What is still missing, and why it cannot be closed here
 
 - **No certification.** The 999 checks envelope integrity, required segments,
   required elements and code values — not implementation-guide situational
-  rules, loop repetition limits, or CTX context segments, and it is not tested
-  against a certification suite. **No TA1** (interchange acknowledgement) at all.
-- **The throttle is in-process and single-node.** The buckets are a dict, so
-  a second instance doubles every limit. Real deployment needs shared state
-  (Redis, or a gateway that owns the counter). No burst borrowing across
-  windows, no per-endpoint limits, and — a real gap — **no priority lanes**: an
-  eligibility check at a bedside is not the same request as a batch
-  reconciliation, and this throttles them identically.
-- **The dashboard has no time series and no persistence.** Counters are
-  in-memory and reset with the process, so there is no trend, no alerting, and
-  no way to answer "when did partner B's rejection rate change".
-- **Agreement enforcement covers volume only.** A real TPA also governs
+  rules, loop repetition limits, or CTX segments. A certification suite (Edifecs,
+  Claredi) is licensed software and is not available offline.
+- **No TA3, and TA1 duplicate detection is in-process.** The ISA control-number
+  history lives in memory, so a restart forgets it and a replayed interchange
+  from before the restart is accepted. Real duplicate detection needs a
+  persistent, per-partner control-number store.
+- **The throttle and lanes are single-node.** The buckets are a dict, so a
+  second instance doubles every limit. Shared state (Redis, or a gateway that
+  owns the counter) is the answer and needs infrastructure this does not have.
+- **The dashboard has no time series and no persistence.** Counters reset with
+  the process, so there is no trend and no way to answer "when did partner B's
+  rejection rate change".
+- **Agreement enforcement covers volume and lane only.** A real TPA also governs
   transaction types, hours of operation, test-versus-production separation,
-  connectivity method and certificate rotation. None of those is enforced.
-- **The HTTP layer has no authentication.** The trading partner is taken from
-  a header, which anyone can set — so the throttle is an honesty system, not a
-  control. Real EDI connectivity is mutually-authenticated (AS2 certificates,
-  SFTP keys, or mTLS), and identity has to come from the transport rather than
-  from a header.
-- **No 837 claim submission**, no 835 remittance, no 834 enrolment — so the
-  claims store is populated by a direct `adjudicate()` call rather than by the
-  transaction that would really create it.
-- **No real adjudication engine**: one contracted rate (62% of billed), no fee
-  schedules, no bundling, no COB, no prior-auth enforcement despite the
+  connectivity method and certificate rotation.
+- **The HTTP layer has no authentication.** The trading partner comes from a
+  header anyone can set, so the throttle is an honesty system rather than a
+  control. Real EDI connectivity is mutually authenticated — AS2 certificates,
+  SFTP keys, mTLS — and identity has to come from the transport.
+- **No 837, 835 or 834.** The claims store is populated by a direct
+  `adjudicate()` call rather than by the transaction that would really create
+  it, and those transaction sets are large enough to be their own project.
+- **No real adjudication engine.** One contracted rate (62% of billed), no fee
+  schedules, no bundling, no COB, and no prior-auth enforcement despite the
   `requires_auth` column existing.
-- **Five members and two plans.** Enough to exercise every branch, not enough to
-  say anything about scale.
+- **Five members and two plans.** Enough to exercise every branch, not enough
+  to say anything about scale.
 
 ## Files
 
@@ -325,5 +394,7 @@ the envelope was fine.
 | `src/throttle.py` | TPA-driven token bucket; refusal expressed as AAA 42/R |
 | `serve.py` | HTTP facade (X12 and JSON), throttle, transaction dashboard |
 | `demo_http.py` | exercises both facades and the throttle in both |
+| `src/ta1.py` | interchange acknowledgement, and one-directional priority lanes |
+| `tests/test_ta1.py` | 19 tests: the TA104 derivation, and batch not starving interactive |
 | `tests/test_http.py` | 23 tests: the bucket, the X12 refusal, the dashboard |
 | `tests/test_edi.py` | 36 tests |
