@@ -1,4 +1,4 @@
-# SE-2 — Eligibility & claim status (X12 EDI facade) — complete
+# SE-2 — Eligibility & claim status (X12 EDI facade) — working system, 9 known gaps
 
 270/271 and 276/277 with real envelopes, real control numbers, and real AAA
 rejection semantics — behind a JSON facade that **refuses to flatten an
