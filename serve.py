@@ -404,7 +404,7 @@ def render_dashboard():
         for r in th)
     d = s["response_ms"]
     return f"""<!doctype html><meta charset="utf-8">
-<title>X12 eligibility — transaction dashboard</title>
+<title>X12 eligibility: transaction dashboard</title>
 <style>
  body{{font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;
       margin:2rem auto;padding:0 1rem;color:#1c1c1e}}
